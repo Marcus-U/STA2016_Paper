@@ -1,0 +1,832 @@
+---
+title: "STA2016 Final Project"
+author: "Marcus Uhthoff"
+date: "2024-12-13"
+output: pdf_document
+always_allow_html: true
+---
+
+```{r setup, include=FALSE, echo = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(leaflet)
+library(leaflet.extras)
+library(fields)
+library(sf)
+library(mgcv)
+library(mgcViz)
+library(geoR)
+library(spdep)
+library(spData)
+library(spatialreg)
+library(spaMM)
+library(spatstat)
+library(splancs)
+library(dbscan)
+library(knitr)
+library(dplyr)
+library(sp)
+library(readr)
+library(raster)
+library(rmapshaper)
+library(patchwork)
+library(kableExtra)
+library(gridExtra)
+library(leaflet.extras2)
+library(gt)
+library(palmerpenguins)
+library(htmlwidgets)
+library(magick)
+
+data.dir = gsub('/code', '/data', getwd())
+
+```
+
+```{r datasets, include=FALSE, echo = FALSE}
+
+#Stations
+stations.data = read.csv(paste0(data.dir, "/stations2.csv"))
+stations <- st_as_sf(stations.data, coords = c("lon", "lat"), crs = 4326) %>% mutate(
+    lon = st_coordinates(geometry)[, 1],  # Extract x coordinate in km
+    lat = st_coordinates(geometry)[, 2]  # Extract y coordinate in km
+  )
+stations <- stations %>% st_transform(crs = 3161)
+
+stations <- stations %>%
+  mutate(
+    X = st_coordinates(geometry)[, 1] / 1000,  # Extract x coordinate in km
+    Y = st_coordinates(geometry)[, 2] / 1000  # Extract y coordinate in km
+  )
+
+station.buffer = stations %>% 
+  st_transform(crs=3161) %>% 
+  st_buffer(dist=5e4)
+
+
+ontario <- st_read(paste0(data.dir, '/province/Province.shp')) %>% st_transform(crs = 3161)
+
+#Station measurements
+no2.daily = read.csv(paste0(data.dir, "/cleaned_v2.csv"))
+no2.daily$average = rowMeans(no2.daily[ , !(names(no2.daily) %in% c("Station_ID", "Pollutant", "Date"))], na.rm = TRUE)
+
+# Load in road data
+roads <- read.csv(paste0(data.dir, "/kms_cleaned.csv"))
+
+# Join stations and measurements
+no2.yearly <- no2.daily %>%
+  group_by(Station_ID) %>%
+  summarize(no2 = mean(average, na.rm = TRUE), .groups = "drop")
+
+stations <- merge(stations, no2.yearly, by = "Station_ID")
+stations$logno2 = log(stations$no2)
+
+stations <- merge(stations, roads[,setdiff(names(roads),c("Station_name", "address","Elevation","Height_of_intake"))], by = "Station_ID")
+```
+
+# Abstract
+
+TODO Fill in abstract
+
+TODO Fill in abstract
+
+TODO Fill in abstract
+
+TODO Fill in abstract
+
+TODO Fill in abstract
+
+TODO Fill in abstract
+
+# Introduction
+
+With increasing concerns about the impact of human activities on the climate, environment, and public health, this study seeks to contribute to the understanding of these complex interactions by focusing on a specific facet of the issue. Among the various factors influencing environmental degradation, this paper examines the relationship between vehicle usage and nitrogen oxides (NOx) concentration in Ontario.
+
+NOx is produced primarily through the combustion processes in vehicles, power plants, and industrial activities. These compounds are well-documented for their adverse effects on human health, including an increased risk of respiratory illnesses such as asthma and chronic obstructive pulmonary disease (COPD). Additionally, NOx plays a significant role in environmental degradation, serving as a precursor to acid rain, which can have far-reaching consequences for ecosystems and infrastructure. By exploring the association between vehicular emissions and NOx levels, this research aims to shed light on the environmental and health implications of transportation-related pollution in Ontario.
+
+According to a 2010 study by the government of Canada, roughly 55% of the Nitrogen Oxides Emissions were from road transportation, as shown in Figure 1.
+
+```{r piechart, echo=FALSE, out.width='50%', fig.align = 'center',fig.cap='2010 Canadian NOx Emissions by Source (total 2.06 Mt)'}
+knitr::include_graphics("C:/Users/Welcome/Documents/MScAC/STA2016/Project/data/NOx_Canada.png")
+```
+
+# Methods
+
+## Data Sources
+
+### Air pollution levels
+
+The data for Nitrogen Oxide levels were collected from the Ontario Ministry of the Environment, Conservation, and Parks. The government branch collects hourly geostatistical data for air pollutants across 43 different locations within Ontario. A webscraping script was written in python to collect the hourly data from each of the 43 stations separate web pages. Additionally, a second script was written to collect station information including geographical position, elevation, and height of the air intake. Below in Table 1 is a summary of the features collected.
+
+```{r tables, results= 'asis', echo=FALSE}
+stations_table <- data.frame(Column = c("Station_name", "Stations_ID", "address", "lon","lat","Elevation","Height_of_Intake"), Description = c("Location of Station", "Unique Identifier","street address of station","Longitude","Lattitude","Elevation at the location of the station","Height above ground of air intake"))
+
+measurement_table <- data.frame(Column = c("Station_ID", "Pollutant", "Date", "H1","...","H24"), Description = c("Unique Identifier","For this study only used NOx","Date of recording","NOx levels (ppb) at hour 1","...","NOx levels (ppb) at hour 24"))
+
+
+cat("
+\\begin{table}[h]
+\\centering
+\\caption{NOx Concentration Data}  % Add caption for the first table
+\\begin{minipage}[t]{0.4\\textwidth}
+\\textbf{Station details}
+\\centering
+\\
+", kable(stations_table, format = "latex", booktabs = TRUE), "
+\\end{minipage}
+\\hfill
+\\begin{minipage}[t]{0.4\\textwidth}
+\\textbf{Station pollutant measurements}
+\\centering
+\\
+", kable(measurement_table, format = "latex", booktabs = TRUE), "
+\\end{minipage}
+\\end{table}
+")
+```
+
+### Ontario Road Infrastructure
+
+A public database maintained by the Ontario Ministry of Natural Resources and Forestry containing over 250,000 km of Ontario roads. The database includes the road classification, number of lanes, road surface, speed limit, and more. This database is available as a shapefile for download from the ministry's website. Due to the file's size and the computational limitiations of the computer used for this project, the entire dataset cannot be displayed as a map. Table 2 shows the full list of all the features provided by the dataset.
+
+```{r road_infra, include=TRUE, echo = FALSE, result = 'asis', tab.cap="Road Infra"}
+roads_table <- data.frame(Column =c( 
+"ROAD_NET_E",
+"FULL_STREE",
+"L_FIRST_HO",
+"L_LAST_HOU",
+"L_HOUSE_NU",
+"L_STANDARD",
+"R_FIRST_HO",
+"R_LAST_HOU",
+"R_HOUSE_NU",
+"R_STANDARD",
+"ALT_STREET",
+"EFFECTIVE_",
+"SPEED_LIMI",
+"NUMBER_OF_",
+"PAVEMENT_S",
+"ROAD_CLASS",
+"JURISDICTI",
+"ROUTE_NUMB",
+"DIRECTION_",
+"GEOMETRY_U",
+"SHIELD_TYP",
+"ROAD_ELEME",
+"LENGTH",
+"geometry"), 
+Description = c(
+"Unique Identifier",
+"Full name of street",
+"left Lowest house number within segment",
+"Left Highest house number within segment",
+"Left House number structure",
+"Municipality of homes on Left",
+"Right Lowest house number within segment",
+"Right Highest house number within segment",
+"Right House number structure",
+"Municipality of homes on Right",
+"Alternate street name",
+"Date of recording",
+"Speed limit",
+"Number of lanes ",
+"Status of road surface (paved/ unpaved)",
+"Road classification (e.g. local, highway)",
+"Governing jurisdiction",
+"Route for highways",
+"Direction of traffic flow (one way or both)",
+"Date of latest geometry update",
+"Highway shield type",
+"Road element type (e.g., road, ferry)",
+"Length of the segment (m)",
+"Shapefile Geometry points"
+ ))
+
+# Took out html
+roads_html <- kable(roads_table) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = FALSE)
+
+
+roads_html
+```
+
+## Data Processing
+
+To perform the intended statistical analysis the different datasets were loaded into R, processed, and then merged. To simplify the the NOx dataset, the data was aggregated. First, a boxplot was done to understand the NOx trend throughout the day, the resulting graph is shown below, note outlier points have been removed for readability:
+
+```{r hourly, echo = FALSE, fig.cap="Average hourly NOx levels", fig.align='center', out.width="50%"}
+# Hourly
+hours = c("H1","H2","H3","H4","H5","H6","H7","H8","H9","H10","H11","H12","H13","H14","H15","H16","H17","H18","H19","H20","H21","H22","H23","H24")
+no2.hourly.long <- no2.daily %>%
+  mutate(Row = 1:nrow(no2.daily)) %>%  # Add a row identifier
+  pivot_longer(cols = hours, names_to = "feature", values_to = "Value")
+
+no2.hourly.long$feature <- factor(no2.hourly.long$feature, levels = hours)
+
+box_plot <- ggplot(no2.hourly.long, aes(x = factor(feature, levels = hours), y = Value)) +
+  geom_boxplot(aes(fill = feature), alpha = 0.7,outlier.shape = NA) +  # Boxplot with colors for each feature
+  labs(
+    title = "",
+    x = "Hour",
+    y = "Concentration (ppb)",
+    fill= "Hour"
+  ) +
+  scale_y_continuous(limits = c(0, 30), breaks = seq(0, 30, by = 10)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))  # Rotate x-axis labels for better visibility
+
+# Display the plot
+print(box_plot)
+```
+
+Based on the plot, we can summarize that while there is a peak around 8am the variance within a day is minimal. Next, the yearly trend of a few key locations was examined. Figure 2illustrates the average NOx ppb over the course of 2023.
+
+```{r daily, echo=FALSE, message=FALSE, warning=FALSE, fig.cap="Daily NOx levels across stations in 2023", out.width="50%"}
+no2.daily_plot <- no2.daily[, c("Station_ID", "Date", "average")]
+
+no2.daily_plot$Date <- as.Date(no2.daily_plot$Date, format = "%Y-%m-%d")
+
+
+line_plot1 <- ggplot(no2.daily_plot %>% filter(Station_ID == 31129), aes(x = Date, y = average)) +
+  geom_point(color = "blue", size = 1) +  # Add a blue line
+  labs(
+    title = "Downtown Toronto",
+    x = "Date",
+    y = "Daily NOx (ppb)"
+  ) +
+   scale_x_date(
+    date_labels = "%b",  # Format to show abbreviated month names (e.g., Jan, Feb)
+    date_breaks = "6 month"  # Set the axis breaks to show monthly intervals
+  ) +
+  theme_minimal()
+  
+  line_plot2 <- ggplot(no2.daily_plot %>% filter(Station_ID == 63203), aes(x = Date, y = average)) +
+  geom_point(color = "blue", size = 1) +  # Add a blue line
+  labs(
+    title = "Thunder Bay",
+    x = "Date",
+    y = "Daily NOx (ppb)"
+  ) +
+   scale_x_date(
+    date_labels = "%b",  # Format to show abbreviated month names (e.g., Jan, Feb)
+    date_breaks = "6 month"  # Set the axis breaks to show monthly intervals
+  ) +
+  theme_minimal()
+  
+  line_plot3 <- ggplot(no2.daily_plot %>% filter(Station_ID == 75010), aes(x = Date, y = average)) +
+  geom_point(color = "blue", size = 1) +  # Add a blue line
+  labs(
+    title = "North Bay",
+    x = "Date",
+    y = "Daily NOx (ppb)"
+  ) +
+   scale_x_date(
+    date_labels = "%b",  # Format to show abbreviated month names (e.g., Jan, Feb)
+    date_breaks = "6 month"  # Set the axis breaks to show monthly intervals
+  ) +
+  theme_minimal()
+
+# Display the plot
+line_plot1 + line_plot2 + line_plot3
+```
+
+The data exhibits variation throughout the year, however there is no discernible trend observed across the three locations. Given the absence of a clear temporal pattern, it is statistically justifiable to calculate the average of the daily statistics for each station as a representative measure of NOx concentration at each location.
+
+After collecting each stations average NOx reading, the distribution of NOx levels was analyzed both in its untransformed state and after applying a logarithmic transformation. Figure 4 illustrates the distribution for both cases. The log-transformed data more closely approximates a normal distribution, suggesting its suitability for subsequent analysis. As a result, the log-transformed NOx levels will be used in this study.
+
+```{r log_arg, fig.cap="NOx yearly concentations under no transformation and log transformation", fig.align = "center", out.width="50%"}
+hist_A <- ggplot(subset(stations), aes(x = no2)) +
+  geom_histogram(bins = 10, fill = "skyblue", color = "black") +
+  labs(title = "NOx concentrations (ppb)", x = "NOx level", y = "")+
+  theme_minimal()
+
+hist_B <- ggplot(subset(stations), aes(x = logno2)) +
+  geom_histogram(bins = 10, fill = "lightgreen", color = "black") +
+  labs(title = "Log NOx concentrations (ppb)", x = "log NOx level", y = "") +
+  theme_minimal()
+
+# Arrange the histograms side by side
+grid.arrange(hist_A, hist_B, ncol = 2)
+
+```
+
+Using the log-transformed data, a spatial visualization of the monitoring stations and their corresponding log-transformed NOx levels is presented in Figure 5. A visual inspection of the map reveals that the highest NOx levels are concentrated in larger urban centers, such as Toronto and Windsor. Additionally, the station density is noticeably higher within these metropolitan areas.
+
+Given that the Thunder Bay station is geographically isolated from the other locations, it will be excluded from the dataset. This exclusion ensures a higher spatial density of stations within the primary study domain, facilitating a more robust analysis.
+
+```{r map_station, fig.cap = "Map of NOx stations with average yearly concentration readings", fig.align='center', out.width="75%"}
+pal <- colorNumeric(palette = "YlOrRd", domain = stations$logno2)
+
+
+map = leaflet(stations %>% st_transform(crs = 4326)) %>%
+  addProviderTiles('CartoDB.Positron', group = "BaseMap", ) %>%
+  addCircleMarkers(radius = 5, 
+                   stroke = FALSE,  
+                   color = ~pal(logno2),  # Color based on numeric 'value'
+                   fillOpacity = 1,
+                    popup = ~paste("Value:", round(logno2,2)))  %>%# Display value in popup, label = ~Station_name) 
+  addScaleBar() %>%
+  leaflet::addLegend(
+    position = "bottomleft",  # Position of the legend
+    pal = pal,              # The color palette
+    values = stations$logno2,   # The variable for the legend
+    title = "log NO2 ppb",     # Legend title
+    opacity = 1             # Legend opacity
+  )
+
+saveWidget(map, "map.html")
+webshot::webshot("map.html", file = "map.png")  # Requires the webshot package and PhantomJS
+
+# Include the image in R Markdown
+#knitr::include_graphics("map.png")
+
+
+```
+
+# Spatial Computations
+
+To facilitate further spatial analysis and integration of the datasets, a spatial relationship between the monitoring stations and road network was established. Road network data were incorporated as a covariate in the spatial analysis for each station. This was achieved by creating a 50 km buffer around each monitoring station and then performing a spatial intersection of all the roads within each buffer, with the roads split based on road type. Road types include 'local streets', 'highways', and 'arterial' roads. This categorization provides a detailed representation of the road network's composition in the vicinity of each station and supports subsequent analyses of the relationship between road infrastructure and NOx levels.
+
+```{r}
+stations <- stations[-33,]
+```
+
+```{r road_types}
+data <- data.frame(
+  Category = c("Local / Street", "Resource / Recreation", "Local / Strata", 
+               "Collector", "Arterial", "Expressway / Highway"),
+  Percentage = c(52, 21, 10, 8, 6, 3)
+)
+
+# Add a percentage symbol to the Percentage column
+data$Percentage <- paste0(data$Percentage, "%")
+
+# Create the kable table with styling
+# Removed html
+kable(data, caption = "Road Category Distribution") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = FALSE)
+```
+
+Then a spatial join was performed between the buffer region around each station and each of the different road types. Note that since the road infrastructure dataset often breaks a single road into smaller segments, and that each segment can vary wildly in length, it was determined that a simple count of road observations within each buffer would not be a sufficient metric. So instead of the count, the length of each road segment within a buffer was calculated. While this was far more computationally expensive, it was only required to be done once to capture the necessary data. Below in Figure XX are some of the stations with the 50km buffers depicted on the left and an example of the roads within the Belleville station’s buffer zone.
+
+```{r barrie_doubleclick, include = FALSE}
+road_net = st_read(paste0(data.dir, '/road_infra/Ontario_Road_Network_(ORN)_Composite_-_Segment.shp')) %>% st_transform(crs = 3161)
+
+station.buffer = stations %>% 
+#  st_transform(crs=3161) %>% 
+  st_buffer(dist=5e4)
+
+
+barrie <- st_intersects(station.buffer[30,],road_net)
+intersected_lines <- road_net[unlist(barrie),]
+
+```
+
+```{r maps_side_by_side, out.width="75%", fig.align='center', fig.cap = "50km buffers on stations and road infrastructure"}
+map = leaflet() %>%
+addMapPane("left", zIndex = 0) %>%
+addMapPane("right", zIndex = 0) %>%
+
+addProviderTiles('CartoDB.Positron', group = "BaseMap", layerId = "buffers", options = pathOptions(pane = "left")) %>%
+addProviderTiles('CartoDB.Positron', group = "BaseMap", layerId = "zoomIn", options = pathOptions(pane = "right")) %>%
+
+  addCircleMarkers(data = stations %>% st_transform(crs= 4326),radius = 3, stroke = FALSE, fillOpacity = 0.9, label = ~Station_name, color = "black",options = pathOptions(pane = "left")) %>%
+  addPolygons(data = station.buffer %>% st_transform(crs= 4326), color = "black", weight = 1, fillColor = "grey", fillOpacity = 0.1,options = pathOptions(pane = "left")) %>%
+  
+  addPolygons(data = station.buffer[30,] %>% st_transform(crs= 4326), color = "black", weight = 1, fillColor = "grey", fillOpacity = 0.1,options = pathOptions(pane = "right")) %>%
+  addPolylines(data = intersected_lines %>% st_transform(crs= 4326), weight = 0.3,options = pathOptions(pane = "right")) %>%
+  addSidebyside(layerId = "sidecontrols",
+                rightId = "zoomIn",
+                leftId = "buffers")
+
+saveWidget(map, "map2.html")
+webshot::webshot("map2.html", file = "map2.png")  # Requires the webshot package and PhantomJS
+
+# Include the image in R Markdown
+#knitr::include_graphics("map2.png")
+```
+
+# Data Exploration
+
+## Variograms
+
+The first step in the data exploration process after performing a review of the maps shown above was to fit a semivariogram to the data to understand the spatial autocorrelation between the stations. Below Figure XX shows the full cloud variogram on the left and on the right the binned variogram, with the binning range and number of bins determined through trail and error.
+
+```{r variog, include= FALSE}
+stations.no2.data <- stations %>% st_drop_geometry()
+stations.geo <- as.geodata(stations.no2.data,coords.col=c(8,9),data.col=10)
+stations.geo.log <- as.geodata(stations.no2.data,coords.col=c(8,9),data.col=11)
+# Using Log
+
+vario1<-variog(stations.geo.log,option="cloud",estimator.type="modulus")
+vario2<-variog(stations.geo.log,uvec=seq(0, 250,l=20),option="bin",estimator.type="modulus")
+```
+
+```{r, fig.cap="Semivariogram for log NOx concentrations", out.width="75%"}
+par(mfrow = c(1, 2)) 
+
+# Plot the cloud variogram
+plot(vario1, xlab = "Distance (h)", main = "Cloud variogram")
+
+# Plot the binned variogram
+plot(vario2, xlab = "Distance (h)", main = "Binned variogram")
+
+# Reset the plot layout to default (1 plot per page)
+par(mfrow = c(1, 1))
+```
+
+Based on the plots we see that there is a definite trend within the semivariograms. By analyzing the binned semivariogram we can estimate the parameters of the semivariogram should be:
+
+-   **sill**: \~0.4
+
+-   **range:**\~ 50- 200
+
+-   **nugget:** \~0
+
+The theoretical semivariogram was fitted to the data using a range of candidate models. A subset of these fitted semivariograms is presented in the figure below. While there is no universally strict computational criterion for selecting the optimal variogram across all methods (e.g., AIC is only applicable for ML and REML approaches), the final selection was made based on visual inspection and alignment with the observed empirical semivariogram.
+
+From the evaluated models, the exponential variogram fitted using ordinary least squares (OLS) was determined to provide the best representation of the data. This model will be used in subsequent analyses requiring a variogram. The exponential variogram is mathematically defined as: $$\gamma(h) = \tau^2 + \sigma^2 (1-\exp(-h/\phi)) $$ For the fitted variogram the final parameters were:
+
+-   **nugget** (tau squared): 0
+
+-   **sill** (sigma squared): 0.50
+
+-   **range** (phi): 69.00
+
+Which are all within the ranges of the expected values described from visual inspection of the variograms above
+
+```{r fit_vario, include = FALSE, echo = FALSE}
+## ---------- FITTING VARIOGRAM --------------
+
+
+vfit_ols_e=variofit(vario2,ini.cov.pars=c(0.5,100),nugget=0.05,fix.nugget=FALSE,cov.model='exponential', weights="equal")
+vfit_ols_g=variofit(vario2,ini.cov.pars=c(0.5,100),nugget=0.05,fix.nugget=FALSE,cov.model='gaussian', weights="equal")
+summary(vfit_ols_e)
+
+vfit_wls_e=variofit(vario2,ini.cov.pars=c(0.5,100),nugget=0.05,fix.nugget=FALSE,cov.model='exponential', weights="cressie")
+vfit_wls_g=variofit(vario2,ini.cov.pars=c(0.5,100),nugget=0.05,fix.nugget=FALSE,cov.model='gaussian', weights="cressie")
+
+mlfit_exp=likfit(stations.geo.log,ini.cov.pars=c(0.1,60),nugget=0.05, fix.nugget=FALSE, cov.model='exponential', lik.method='ML')
+mlfit_gau=likfit(stations.geo.log,ini.cov.pars=c(0.1,60),nugget=0.05, fix.nugget=FALSE,cov.model='gaussian', lik.method='ML')
+remlfit_exp=likfit(stations.geo.log,ini.cov.pars=c(0.1,60),nugget=0.05, fix.nugget=FALSE,cov.model='exponential', lik.method='REML')
+remlfit_gau=likfit(stations.geo.log,ini.cov.pars=c(0.1,60),nugget=0.05, fix.nugget=FALSE,cov.model='gaussian', lik.method='REML')
+```
+
+```{r vario_plots, echo = FALSE, fig.cap = "Fitted theoretical variograms"}
+
+par(mfrow = c(1, 2), mar = c(2,2,2,2)) 
+plot(vario2,xlab="Distance (h), km")
+
+lines(vfit_ols_e,col="blue",lwd=1.5)
+lines(vfit_ols_g,col="red",lwd=1.5)
+lines(vfit_wls_e,col="darkgreen",lwd=1.5)
+lines(vfit_wls_g,col="brown",lwd=1.5)
+legend("topleft",                          # Position of the legend (can be "topright", "topleft", etc.)
+       legend = c("Exponential Model OLS", "Gaussian Model OLS", "Exponential Model WLS", "Gaussian Model WLS"),  # Labels for the models
+       col = c("blue", "red", "darkgreen","brown"),               # Colors for each line
+       lty = 1,                              # Line type (solid lines)
+       lwd = 1.5,                            # Line width
+       box.lwd = 0.5,
+       cex = 0.6,
+       bg = "white")                        # Line width for the legend box
+
+
+plot(vario2,xlab="Distance (h), km")
+lines(mlfit_exp,col="blue")
+lines(mlfit_gau,col="red")
+lines(remlfit_exp,col="darkgreen")
+lines(remlfit_gau,col="brown")
+legend("topleft",                          # Position of the legend (can be "topright", "topleft", etc.)
+       legend = c("Exponential Model ML", "Gaussian Model ML", "Exponential Model REML", "Gaussian Model REML"),  # Labels for the models
+       col = c("blue", "red", "darkgreen","brown"),               # Colors for each line
+       lty = 1,                              # Line type (solid lines)
+       lwd = 1.5,                            # Line width
+       box.lwd = 0.5,
+       cex = 0.6,
+       bg = "white")                        # Line width for the legend box
+
+par(mfrow = c(1, 1)) 
+```
+
+## Moran's I
+
+The spatial autocorrelation of the NOx monitoring stations were assessed using Moran's I. Moran's I is a measure that evaluates the degree of spatial clustering, dispersion, or randomness of a spatial process. To conduct the Moran's I test, it is necessary to define a spatial weights matrix that describes the relationships between the stations. Given that the data is not areal, conventional weight matrices such as the queen or rook contiguity are not applicable. Instead, two alternative approaches—K-Nearest Neighbors (KNN) and inverse distance weighting—were employed.
+
+-   **KNN**: For each station, an equal weight is assigned to the k nearest stations. The value of k was determined to be 4 after conducting a hyperparameter search aimed at minimizing the p-value.
+
+-   **Inverse distance**: The weight between two stations is defined inversely proportional to the distance separating them, meaning that stations located closer to each other are assigned higher weights.
+
+Under both weight matrix configurations, the null hypothesis of no spatial autocorrelation was strongly rejected, with p-values of 6.05e-6 for KNN and 6.44e-5 for inverse distance. Corresponding Moran’s I values were 0.35 and 0.18, respectively, indicating the presence of significant positive spatial autocorrelation among the stations. Figure TODO shows the results of the monte carlo simulation, once again showing that under both weigth matrices the NOx concentration are positively spatially auto correlated. As the K-nearest neighbour has the lower p-value and higher moran's I score we will use that moving forward.
+
+```{r Morans_I_calc, include = FALSE}
+# TODO switch to indlue = false
+coords <- st_coordinates(stations)
+
+# KNN
+stations_kn<-knn2nb(knearneigh(coords, k=4))
+stations_kn_w<-nb2listw(stations_kn, style="W")
+
+# Inverse Distance
+dist_matrix <- as.matrix(dist(coords[, c("X", "Y")]))  # Euclidean distances
+inv_dist_matrix <- 1 / dist_matrix
+diag(inv_dist_matrix) <- 0  # Avoid dividing by zero on the diagonal
+weights_matrix <- sweep(inv_dist_matrix, 1, rowSums(inv_dist_matrix), FUN = "/")
+id_weights_list <- mat2listw(weights_matrix)
+
+
+# KNN Morans I
+moran_knn<-moran.test(stations$logno2, stations_kn_w, randomisation = F, alternative = "two.sided")
+moran_knn
+
+moran_mc_knn<- moran.mc(stations$logno2,stations_kn_w, nsim=9999, alternative="two.sided") 
+moran_mc_knn
+
+
+
+# ID Morans I
+moran.ID<-moran.test(stations$logno2, id_weights_list, randomisation = F, alternative = "two.sided")
+moran.ID
+
+moran_mc.ID<- moran.mc(stations$logno2,id_weights_list, nsim=9999, alternative="two.sided") 
+moran_mc.ID
+
+
+```
+
+```{r Morans_I_plot, fig.cap = "Moran's I MC simulation under different weight matrices"}
+par(mfrow = c(1, 2)) 
+distr999_knn<- hist(moran_mc_knn$res,freq=TRUE,col="light blue",main="Moran's I - KNN",breaks=75)
+lines(moran_mc_knn$statistic,max(distr999_knn$counts),type="h",col="red",lwd=2)
+
+
+distr999_ID<- hist(moran_mc.ID$res,freq=TRUE,col="light blue",main="Moran's I - Inverse Distance",breaks=75)
+lines(moran_mc.ID$statistic,max(distr999_ID$counts),type="h",col="red",lwd=2)
+par(mfrow = c(1, 1)) 
+```
+
+# Spatial Modeling
+
+Now that we have determined a semivariogram and weight matrix we look to create spatial models of our process to better understand the underlying relationships. In order to evaluate the relationship between our covariates and the NOx pollutant concentrations.
+
+TODO talk about split
+
+```{r split_data, include = FALSE}
+set.seed(123)
+s<-sample(1:nrow(stations),dim(stations)[1]*.8,replace=FALSE)
+temp<-1:length(stations$logno2)
+temp[s]<-0
+testset<-temp[temp!=0]
+test<-stations[testset,]
+train<-stations[s,]
+
+```
+
+## Kriging
+
+There are 3 types of Kriging. Simple, ordinary, and universal kriging. All three types are spatial interpolation methods to predict an unknown value of a variable at unobserved locations. The key difference is in the assumptions of the three forms of kriging, where:
+
+-   **Simple**: Assumes the mean of the process (this case NOx concentrations) is known and constant across the entire area
+
+-   **Ordinary:** Assumes that the mean is constant but unknown, allowing for a more flexible model
+
+-   **Universal:** Assumes the mean follows a trend in the x and y and other spatial covariates
+
+First simple and ordinary kriging were performed. Figure X shows the resulting interpolation across Ontario. Since the stations are sparsely populate there are large regions of Ontario that will only be predicted based on the mean. As such these method are not necessarily very good options, as evidenced by the standard error plots in the figure below. However, the predictions seem to be acceptable in regions with more stations. Universal kriging was not selected as a potential model since the data does not show any statistically significant trend in the x or y coordinates of the data.
+
+```{r Kriging_math, include = FALSE}
+# Simple Kriging
+res_ont=100
+xs_ont=seq(min(st_coordinates(stations)[, 1])/1000,max(st_coordinates(stations)[, 1])/1000,len=res_ont)
+ys_ont=seq(min(st_coordinates(stations)[, 2])/1000,max(st_coordinates(stations)[, 2])/1000,len=res_ont)
+OntGrid=expand.grid(xs_ont,ys_ont)
+names(OntGrid)=c('X','Y')
+
+res_tor=500
+xs_tor=seq(1000,1500,len=res_tor)
+ys_tor=seq(11500,12500,len=res_tor)
+TorontoGrid=expand.grid(xs_tor,ys_tor)
+names(TorontoGrid)=c('X','Y')
+
+res = res_ont
+Grid = OntGrid
+xs = xs_ont
+ys = ys_ont
+
+
+KCsimple<-krige.control(type.krige="sk",obj.m=vfit_ols_e,beta=2)
+simple_krig<-krige.conv(stations.geo.log,locations=Grid,krige=KCsimple)
+
+KCord<-krige.control(type.krige="ok",obj.m=vfit_ols_e,beta=2)
+ord_krig<-krige.conv(stations.geo.log,locations=Grid,krige=KCord)
+```
+
+```{r krigin_plots, echo = FALSE}
+par(mfrow = c(2, 2), mar = c(2,2,2,2))
+image.plot(xs,ys,matrix(simple_krig$predict,res,res,byrow=FALSE),col=tim.colors(32), main="Simple Kriging")
+points(stations.geo.log$coords, col = "black", pch = 16, cex = .5)
+lines(st_coordinates(ontario$geometry)[,1:2]/1000, add = TRUE, col = "black",lwd = 0.01)
+
+image.plot(xs,ys,matrix(ord_krig$predict,res,res,byrow=FALSE),col=tim.colors(32), main="Ordinary Kriging")
+points(stations.geo.log$coords, col = "black", pch = 16, cex = .5)
+lines(st_coordinates(ontario$geometry)[,1:2]/1000, add = TRUE, col = "black",lwd = 0.01)
+
+
+imagePlot(xs,ys,matrix(sqrt(simple_krig$krige.var),res,res,byrow=FALSE),col=tim.colors(32), main="Simple Kriging Errors")
+points(stations.geo.log$coords, col = "black", pch = 16, cex = .5)
+lines(st_coordinates(ontario$geometry)[,1:2]/1000, add = TRUE, col = "black",lwd = 0.01)
+
+imagePlot(xs,ys,matrix(sqrt(ord_krig$krige.var),res,res,byrow=FALSE),col=tim.colors(32), main="Ordinary Kriging Errors")
+points(stations.geo.log$coords, col = "black", pch = 16, cex = .5)
+lines(st_coordinates(ontario$geometry)[,1:2]/1000, add = TRUE, col = "black",lwd = 0.01)
+
+par(mfrow = c(1, 1))
+```
+
+## IDW
+
+Inverse distance weighting is alternative interpolation method that weighs observations based on the distance from the observed locations to the prediction location. For the NOx concentrations 3 options of $\rho$ were tested. Where higher values of $\rho$ corresponded to more localized interpolation. Figure TODO below shows the results TODO add more context
+
+```{r IDW, echo =FALSE}
+idw<-function(data,locs,newlocs,p){
+  dists<-rdist(newlocs,locs)
+  return(((dists^(-p))%*%data)/((dists^(-p))%*%rep(1,length(data)))) 
+}
+
+# testing different p
+idwPred2<-idw(stations$logno2,cbind(stations$X,stations$Y),OntGrid,p=1)
+idwPred6<-idw(stations$logno2,cbind(stations$X,stations$Y),OntGrid,p=2)
+idwPred12<-idw(stations$logno2,cbind(stations$X,stations$Y),OntGrid,p=5)
+
+# plotting the results on our grid
+par(mfrow = c(2,2 ), mar = c(2,2,2,2))
+image.plot(xs_ont,ys_ont,matrix(idwPred2,res_ont,res_ont),col=tim.colors(32), main = "rho = 1")
+points(stations.geo.log$coords, col = "black", pch = 16, cex = .5)
+lines(st_coordinates(ontario$geometry)[,1:2]/1000, add = TRUE, col = "black",lwd = 0.01)
+
+image.plot(xs_ont,ys_ont,matrix(idwPred6,res_ont,res_ont),col=tim.colors(32),main = "rho = 2")
+points(stations.geo.log$coords, col = "black", pch = 16, cex = .5)
+lines(st_coordinates(ontario$geometry)[,1:2]/1000, add = TRUE, col = "black",lwd = 0.01)
+
+image.plot(xs_ont,ys_ont,matrix(idwPred12,res_ont,res_ont),col=tim.colors(32),main = "rho = 5")
+points(stations.geo.log$coords, col = "black", pch = 16, cex = .5)
+lines(st_coordinates(ontario$geometry)[,1:2]/1000, add = TRUE, col = "black",lwd = 0.01)
+par(mfrow = c(1, 1)) 
+
+```
+
+## SAR
+
+Lag model
+
+```{r SAR_lar, echo= FALSE, include = FALSE}
+lonlat_bounds <- st_sfc(
+  st_polygon(list(rbind(c(-85, 42), c(-75, 42), c(-75, 48), c(-85, 48), c(-85, 42)))),
+  crs = 4326
+)
+
+# Transform the bounding box into EPSG:3161
+bounds_3161 <- st_transform(lonlat_bounds, crs = 3161)
+
+# Extract the bounds of the transformed geometry
+bbox_3161 <- st_bbox(bounds_3161)
+
+
+
+mod_sar_error_lag <- sacsarlm(logno2 ~ Local_Street_per + Resource_Recreation_per + Arterial_per + Local_Strata_per + Collector_per + Expressway_Highway_per, data=stations, listw=stations_kn_w)
+summary(mod_sar_error_lag)
+stations$mod_sar_error_lag<-residuals(mod_sar_error_lag)
+
+moran.test(stations$mod_sar_error_lag, stations_kn_w)
+
+simple_sar_error_lag <- sacsarlm(logno2 ~ 1, data=stations, listw=stations_kn_w)
+summary(simple_sar_error_lag)
+stations$simple_sar_error_lag<-residuals(simple_sar_error_lag)
+
+
+moran.test(stations$simple_sar_error_lag, stations_kn_w)
+```
+
+```{r SAR_plot, echo = FALSE}
+sar_common_range <- range(stations$simple_sar_error_lag, stations$mod_sar_error_lag, na.rm = TRUE)
+plot1 = ggplot(stations) + geom_sf(data = ontario)+geom_sf(aes(color = stations$simple_sar_error_lag), size = 3) + scale_color_gradient(low = "#4BACF6", high = "#152F48", limits = sar_common_range)+theme_minimal()+
+  coord_sf(
+    xlim = c(bbox_3161[1], bbox_3161[3]),  # Set the longitude bounds (in meters for EPSG:3161)
+    ylim = c(bbox_3161[2], bbox_3161[4]),  # Set the latitude bounds (in meters for EPSG:3161)
+    expand = FALSE
+  ) +   labs(color = "Residuals") + ggtitle("SAR no Covariates")
+
+plot2 = ggplot(stations) + geom_sf(data = ontario)+geom_sf(aes(color = stations$mod_sar_error_lag), size = 3) + scale_color_gradient(low = "#4BACF6", high = "#152F48", limits = sar_common_range)+ theme_minimal()+
+  coord_sf(
+    xlim = c(bbox_3161[1], bbox_3161[3]),  # Set the longitude bounds (in meters for EPSG:3161)
+    ylim = c(bbox_3161[2], bbox_3161[4]),  # Set the latitude bounds (in meters for EPSG:3161)
+    expand = FALSE
+  ) +   labs(color = "Residuals")+ ggtitle("SAR with Covariates")
+
+plot1+plot2
+```
+
+## GAM
+
+```{r gam_mat, echo= FALSE, include = FALSE}
+gam_no2<-gam(logno2~s(X,Y,bs="ts", k = 10, fx = TRUE),data=stations)
+plot(gam_no2, main="GAM k = ")
+summary(gam_no2)
+
+#COvariates 
+gam_no2_cov<-gam(logno2~ Resource_Recreation + Local_Street + Arterial + Local_Strata + Collector + Expressway_Highway + s(X,Y,bs="ts", k = 10, fx = TRUE),data=stations)
+plot(gam_no2_cov, main="GAM k = ")
+summary(gam_no2_cov)
+
+#v1<-getViz(gam_no2)
+#plot(v1)
+
+
+# Predictions
+
+
+
+
+#LEAFLET
+
+#xs_ll=seq(min(stations$lon),max(stations$lon),len=res)
+#ys_ll=seq(min(stations$lat),max(stations$lat),len=res)
+#myGrid_ll=expand.grid(xs_ll,ys_ll)
+#names(myGrid_ll)=c('X','Y')
+
+#preds = data.frame(myGrid_ll, pred.pm=exp(pred_gam$fit) %>% as.vector)
+#pred.pal = colorNumeric(c('darkgreen','gold1','brown'),
+                        #domain=preds$pred.pm)
+
+
+#leaflet(preds) %>% 
+#  addProviderTiles("CartoDB.Positron") %>% 
+#  addCircles(lng=~X, lat=~Y, color=~pred.pal(pred.pm),
+#             opacity=.7, fillOpacity=.7, radius=1) %>% 
+#  leaflet::addLegend('bottomleft', pal=pred.pal, values=preds$pred.pm,
+#                     title="GAM Pred. PM2.5", opacity=.5)
+```
+
+```{r GAM,echo = FALSE}
+par(mfrow = c(2, 2))
+pred_gam<-predict.gam(gam_no2,Grid,se.fit=TRUE)
+
+image.plot(xs,ys,matrix(pred_gam$fit,res,res),col=tim.colors(32))
+points(stations.geo.log$coords, col = "black", pch = 16, cex = .5)
+lines(st_coordinates(ontario$geometry)[,1:2]/1000, add = TRUE, col = "black",lwd = 0.01)
+
+#STD ERROR
+image.plot(xs,ys,matrix(pred_gam$se.fit,res,res),col=tim.colors(32))
+points(stations.geo.log$coords, col = "black", pch = 16, cex = .5)
+lines(st_coordinates(ontario$geometry)[,1:2]/1000, add = TRUE, col = "black",lwd = 0.01)
+```
+
+## CAR
+
+TODO writeup
+
+```{r CAR_math, include = FALSE}
+#No covariates
+car_model_nocov <- spautolm(logno2 ~1, data=stations, listw=stations_kn_w, family="CAR")
+summary(car_model_nocov)
+
+stations$car_resid_nocov<-residuals(car_model_nocov)
+
+moran.test(stations$car_resid_nocov, stations_kn_w)
+
+#With covariates
+car_model <- spautolm(logno2 ~ Local_Street_per + Resource_Recreation_per + Arterial_per + Local_Strata_per + Collector_per + Expressway_Highway_per, data=stations, listw=stations_kn_w, family="CAR")
+summary(car_model)
+
+stations$car_resid<-residuals(car_model)
+
+moran.test(stations$car_resid, stations_kn_w)
+
+
+```
+
+```{r car_plot, echo=FALSE}
+
+car_common_range <- range(stations$car_resid_nocov, stations$car_resid, na.rm = TRUE)
+
+plot1 = ggplot(stations) + geom_sf(data = ontario)+geom_sf(aes(color = car_resid_nocov), size = 3) + scale_color_gradient(low = "#152F48", high = "#4BACF6", limits = car_common_range) + theme_minimal()+
+  coord_sf(
+    xlim = c(bbox_3161[1], bbox_3161[3]),  # Set the longitude bounds (in meters for EPSG:3161)
+    ylim = c(bbox_3161[2], bbox_3161[4]),  # Set the latitude bounds (in meters for EPSG:3161)
+    expand = FALSE
+  ) +   labs(color = "Residuals")+ ggtitle("CAR without Covariates")
+
+
+plot2 = ggplot(stations) + geom_sf(data = ontario)+geom_sf(aes(color = car_resid), size = 3)+ scale_color_gradient(low = "#152F48", high = "#4BACF6", limits = car_common_range) + theme_minimal()+
+  coord_sf(
+    xlim = c(bbox_3161[1], bbox_3161[3]),  # Set the longitude bounds (in meters for EPSG:3161)
+    ylim = c(bbox_3161[2], bbox_3161[4]),  # Set the latitude bounds (in meters for EPSG:3161)
+    expand = FALSE
+  ) +   labs(color = "Residuals")+ ggtitle("CAR with Covariates")
+grid.arrange(plot1, plot2, ncol = 2)
+```
+
+# Conclusions
+
+# Limitiations
